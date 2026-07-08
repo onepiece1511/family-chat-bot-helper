@@ -6,14 +6,15 @@ import { generateBotReply, type GenerateReplyInput } from "./openai.js";
 import { botRateLimiter, InMemoryRateLimiter } from "./rateLimit.js";
 import { buildRiskyTopicReply, detectRiskyTopic } from "./safety.js";
 import {
-  extractIncomingMessage,
-  sendZaloTextMessage,
+  extractIncomingMessages,
+  sendWhatsAppTextMessage,
   shouldTriggerBot,
   stripBotTrigger,
-  verifyZaloSignature,
-  type ZaloSendInput,
-  type ZaloSendResult
-} from "./zalo.js";
+  verifyWhatsAppSignature,
+  verifyWhatsAppWebhookChallenge,
+  type WhatsAppSendInput,
+  type WhatsAppSendResult
+} from "./whatsapp.js";
 
 dotenv.config({ path: ".env.local", quiet: true });
 dotenv.config({ quiet: true });
@@ -30,14 +31,14 @@ export interface AppDependencies {
   log?: InMemoryEventLog;
   rateLimiter?: InMemoryRateLimiter;
   generateReply?: (input: GenerateReplyInput) => Promise<string>;
-  zaloSender?: (input: ZaloSendInput) => Promise<ZaloSendResult>;
+  whatsappSender?: (input: WhatsAppSendInput) => Promise<WhatsAppSendResult>;
 }
 
 interface WebhookDependencies {
   log: InMemoryEventLog;
   rateLimiter: InMemoryRateLimiter;
   generateReply: (input: GenerateReplyInput) => Promise<string>;
-  zaloSender: (input: ZaloSendInput) => Promise<ZaloSendResult>;
+  whatsappSender: (input: WhatsAppSendInput) => Promise<WhatsAppSendResult>;
 }
 
 export interface WebhookResult {
@@ -50,7 +51,7 @@ export function createApp(dependencies: AppDependencies = {}) {
   const log = dependencies.log || eventLog;
   const rateLimiter = dependencies.rateLimiter || botRateLimiter;
   const generateReply = dependencies.generateReply || generateBotReply;
-  const zaloSender = dependencies.zaloSender || sendZaloTextMessage;
+  const whatsappSender = dependencies.whatsappSender || sendWhatsAppTextMessage;
 
   app.use(
     express.json({
@@ -76,20 +77,31 @@ export function createApp(dependencies: AppDependencies = {}) {
     });
   });
 
-  app.post("/webhook/zalo", async (req: Request, res: Response) => {
-    const signature = req.get("x-zalo-signature") || req.get("x-zalo-app-signature") || req.get("x-hub-signature-256");
-    const signatureOk = verifyZaloSignature(req.rawBody, signature, process.env.ZALO_APP_SECRET);
+  app.get("/webhook/whatsapp", (req: Request, res: Response) => {
+    const verification = verifyWhatsAppWebhookChallenge(req.query);
+
+    if (!verification.verified) {
+      log.add({ type: "error", reason: "invalid_whatsapp_verify_token" });
+      return res.sendStatus(403);
+    }
+
+    return res.status(200).send(verification.challenge);
+  });
+
+  app.post("/webhook/whatsapp", async (req: Request, res: Response) => {
+    const signature = req.get("x-hub-signature-256");
+    const signatureOk = verifyWhatsAppSignature(req.rawBody, signature, process.env.WHATSAPP_APP_SECRET);
 
     if (!signatureOk) {
-      log.add({ type: "error", reason: "invalid_zalo_signature" });
+      log.add({ type: "error", reason: "invalid_whatsapp_signature" });
       return res.status(401).json({ ok: false, error: "invalid_signature" });
     }
 
-    const result = await processZaloWebhook(req.body, {
+    const result = await processWhatsAppWebhook(req.body, {
       log,
       rateLimiter,
       generateReply,
-      zaloSender
+      whatsappSender
     });
 
     return res.status(result.status).json(result.body);
@@ -98,102 +110,112 @@ export function createApp(dependencies: AppDependencies = {}) {
   return app;
 }
 
-export async function processZaloWebhook(payload: unknown, dependencies: WebhookDependencies): Promise<WebhookResult> {
-  const { log, rateLimiter, generateReply, zaloSender } = dependencies;
-  const incoming = extractIncomingMessage(payload);
+export async function processWhatsAppWebhook(payload: unknown, dependencies: WebhookDependencies): Promise<WebhookResult> {
+  const { log, rateLimiter, generateReply, whatsappSender } = dependencies;
+  const incomingMessages = extractIncomingMessages(payload);
 
-  if (!incoming) {
+  if (incomingMessages.length === 0) {
     log.add({ type: "ignored", reason: "no_text_message" });
     return { status: 200, body: { ok: true, ignored: true, reason: "no_text_message" } };
   }
 
-  log.add({
-    type: "incoming",
-    messageId: incoming.messageId,
-    conversationId: incoming.conversationId,
-    senderId: incoming.senderId,
-    text: incoming.text
-  });
+  const results = [];
 
-  if (!shouldTriggerBot(incoming.text)) {
+  for (const incoming of incomingMessages) {
     log.add({
-      type: "ignored",
+      type: "incoming",
       messageId: incoming.messageId,
       conversationId: incoming.conversationId,
       senderId: incoming.senderId,
-      text: incoming.text,
-      reason: "not_triggered"
-    });
-    return { status: 200, body: { ok: true, ignored: true, reason: "not_triggered" } };
-  }
-
-  const rateDecision = rateLimiter.tryReserveReply(incoming.messageId);
-  if (!rateDecision.allowed) {
-    log.add({
-      type: "rate_limited",
-      messageId: incoming.messageId,
-      conversationId: incoming.conversationId,
-      senderId: incoming.senderId,
-      text: incoming.text,
-      reason: rateDecision.reason
-    });
-    return { status: 200, body: { ok: true, ignored: true, reason: rateDecision.reason } };
-  }
-
-  const userMessage = stripBotTrigger(incoming.text);
-  const risk = detectRiskyTopic(userMessage);
-
-  try {
-    const reply = risk.isRisky
-      ? buildRiskyTopicReply()
-      : await generateReply({
-          message: userMessage,
-          isRisky: risk.isRisky,
-          riskCategories: risk.categories
-        });
-
-    const sendResult = await zaloSender({
-      recipientId: incoming.senderId,
-      conversationId: incoming.conversationId,
-      text: reply
+      text: incoming.text
     });
 
-    log.add({
-      type: "replied",
-      messageId: incoming.messageId,
-      conversationId: incoming.conversationId,
-      senderId: incoming.senderId,
-      text: reply,
-      riskCategories: risk.categories
-    });
-    log.add({
-      type: sendResult.sent ? "zalo_sent" : "zalo_skipped",
-      messageId: incoming.messageId,
-      conversationId: incoming.conversationId,
-      senderId: incoming.senderId,
-      reason: sendResult.reason
-    });
+    if (!shouldTriggerBot(incoming.text)) {
+      log.add({
+        type: "ignored",
+        messageId: incoming.messageId,
+        conversationId: incoming.conversationId,
+        senderId: incoming.senderId,
+        text: incoming.text,
+        reason: "not_triggered"
+      });
+      results.push({ messageId: incoming.messageId, ignored: true, reason: "not_triggered" });
+      continue;
+    }
 
-    return {
-      status: 200,
-      body: {
-        ok: true,
+    const rateDecision = rateLimiter.tryReserveReply(incoming.messageId);
+    if (!rateDecision.allowed) {
+      log.add({
+        type: "rate_limited",
+        messageId: incoming.messageId,
+        conversationId: incoming.conversationId,
+        senderId: incoming.senderId,
+        text: incoming.text,
+        reason: rateDecision.reason
+      });
+      results.push({ messageId: incoming.messageId, ignored: true, reason: rateDecision.reason });
+      continue;
+    }
+
+    const userMessage = stripBotTrigger(incoming.text);
+    const risk = detectRiskyTopic(userMessage);
+
+    try {
+      const reply = risk.isRisky
+        ? buildRiskyTopicReply()
+        : await generateReply({
+            message: userMessage,
+            isRisky: risk.isRisky,
+            riskCategories: risk.categories
+          });
+
+      const sendResult = await whatsappSender({
+        recipientPhoneNumber: incoming.senderId,
+        text: reply
+      });
+
+      log.add({
+        type: "replied",
+        messageId: incoming.messageId,
+        conversationId: incoming.conversationId,
+        senderId: incoming.senderId,
+        text: reply,
+        riskCategories: risk.categories
+      });
+      log.add({
+        type: sendResult.sent ? "whatsapp_sent" : "whatsapp_skipped",
+        messageId: incoming.messageId,
+        conversationId: incoming.conversationId,
+        senderId: incoming.senderId,
+        reason: sendResult.reason
+      });
+
+      results.push({
+        messageId: incoming.messageId,
         replied: true,
         reply,
         sendResult,
         risk: risk.isRisky ? risk.categories : []
-      }
-    };
-  } catch (error) {
-    log.add({
-      type: "error",
-      messageId: incoming.messageId,
-      conversationId: incoming.conversationId,
-      senderId: incoming.senderId,
-      reason: error instanceof Error ? error.message : "unknown_error"
-    });
-    return { status: 500, body: { ok: false, error: "reply_failed" } };
+      });
+    } catch (error) {
+      log.add({
+        type: "error",
+        messageId: incoming.messageId,
+        conversationId: incoming.conversationId,
+        senderId: incoming.senderId,
+        reason: error instanceof Error ? error.message : "unknown_error"
+      });
+      return { status: 500, body: { ok: false, error: "reply_failed" } };
+    }
   }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      results
+    }
+  };
 }
 
 const isMainModule = process.argv[1] === fileURLToPath(import.meta.url);
