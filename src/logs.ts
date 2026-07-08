@@ -5,8 +5,8 @@ export type BotEventType =
   | "ignored"
   | "replied"
   | "rate_limited"
-  | "zalo_sent"
-  | "zalo_skipped"
+  | "whatsapp_sent"
+  | "whatsapp_skipped"
   | "error";
 
 export interface BotLogEvent {
